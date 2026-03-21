@@ -1,4 +1,5 @@
 python-telegram-bot
-opencv-python-headless
+opencv-python
+pyzbar
 gspread
 oauth2client
