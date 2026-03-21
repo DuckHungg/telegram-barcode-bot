@@ -3,41 +3,40 @@ import cv2
 import json
 import gspread
 import re
-import numpy as np
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
-# ==========================================
-# 1. CẤU HÌNH BIẾN MÔI TRƯỜNG
-# ==========================================
+# --- MẸO CHẠY MIỄN PHÍ: TẠO SERVER GIẢ ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_health_check():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# --- PHẦN CODE BOT CHÍNH ---
 TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
 
-# ==========================================
-# 2. KẾT NỐI GOOGLE SHEET
-# ==========================================
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        if not creds_json:
-            print("❌ Thiếu biến GOOGLE_CREDENTIALS_JSON")
-            return None
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
-        return client.open_by_key(SHEET_ID).sheet1
-    except Exception as e:
-        print(f"❌ Lỗi kết nối Sheet: {e}")
-        return None
+        return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
+    except: return None
 
 sheet = connect_sheet()
 
-# ==========================================
-# 3. CHUẨN HÓA TIẾNG VIỆT (Fix lỗi nhận diện "BỂ VỠ")
-# ==========================================
 def clean_vntxt(text):
     if not text: return ""
     s = text.lower().strip()
@@ -51,94 +50,47 @@ def clean_vntxt(text):
     return s
 
 def classify_issue(text):
-    if not text: return "KHÁC"
     txt = clean_vntxt(text)
-
-    is_wet = any(x in txt for x in ["uot", "nuoc", "uoc", "dich", "am", "tham"])
-    is_broken = any(x in txt for x in ["be", "vo", "nat", "gay", "mop"])
-    is_torn = any(x in txt for x in ["bung", "rach", "ho", "thung", "toat"])
-    is_missing = any(x in txt for x in ["mat", "thieu", "rong", "trong"])
-
-    if is_broken and is_wet: return "BỂ ƯỚT"
-    if is_torn and is_wet: return "RÁCH ƯỚT"
-    if is_broken: return "BỂ VỠ"
-    if is_torn: return "BUNG RÁCH"
-    if is_missing: return "MẤT RUỘT"
+    if any(x in txt for x in ["be", "vo", "nat", "gay", "mop"]): return "BỂ VỠ"
+    if any(x in txt for x in ["uot", "nuoc", "am", "tham"]): return "ƯỚT"
+    if any(x in txt for x in ["rach", "thung", "bung", "ho"]): return "BUNG RÁCH"
     return "KHÁC"
 
-# ==========================================
-# 4. QUÉT MÃ VẠCH BẰNG OPENCV (Thay thế pyzbar)
-# ==========================================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_path = f"img_{update.message.chat_id}.jpg"
     try:
-        caption = update.message.caption or ""
-        
-        # Tải ảnh từ Telegram
-        photo_file = await update.message.photo[-1].get_file()
-        await photo_file.download_to_drive(temp_path)
-
-        # Đọc ảnh
+        f = await update.message.photo[-1].get_file()
+        await f.download_to_drive(temp_path)
         img = cv2.imread(temp_path)
-        if img is None:
-            await update.message.reply_text("❌ Lỗi định dạng ảnh.")
-            return
-
-        barcode = None
         
-        # Thử quét Barcode
-        try:
-            bd = cv2.barcode.BarcodeDetector()
-            retval, decoded_info, _, _ = bd.detectAndDecode(img)
-            if retval and decoded_info[0]:
-                barcode = decoded_info[0]
-        except: pass
-
-        # Nếu không thấy, thử quét QR Code
+        # Quét bằng OpenCV Barcode & QR
+        bd = cv2.barcode.BarcodeDetector()
+        retval, info, _, _ = bd.detectAndDecode(img)
+        barcode = info[0] if retval and info[0] else None
+        
         if not barcode:
-            qr_detector = cv2.QRCodeDetector()
-            retval, info, _, _ = qr_detector.detectAndDecode(img)
-            if retval:
-                barcode = info
+            qr = cv2.QRCodeDetector()
+            retval, info, _, _ = qr.detectAndDecode(img)
+            barcode = info if retval else None
 
         if not barcode:
-            await update.message.reply_text("❌ Không tìm thấy mã vạch hoặc mã QR.")
+            await update.message.reply_text("❌ Không đọc được mã.")
             return
 
-        # Phân loại lỗi và lưu dữ liệu
-        issue = classify_issue(caption)
-        user = update.message.from_user.full_name
-
+        issue = classify_issue(update.message.caption)
         if sheet:
-            sheet.append_row([
-                datetime.now().strftime("%d/%m/%Y %H:%M:%S"), 
-                barcode, issue, user, caption
-            ])
-            await update.message.reply_text(
-                f"✅ **GHI NHẬN THÀNH CÔNG**\n"
-                f"📦 Mã: `{barcode}`\n"
-                f"⚠️ Lỗi: **{issue}**\n"
-                f"👤 NV: {user}",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text("❗ Lỗi kết nối Google Sheets.")
-
+            sheet.append_row([datetime.now().strftime("%d/%m/%Y %H:%M:%S"), barcode, issue, update.message.from_user.full_name, update.message.caption or ""])
+            await update.message.reply_text(f"✅ **GHI NHẬN THÀNH CÔNG**\n📦 Mã: `{barcode}`\n⚠️ Lỗi: **{issue}**", parse_mode="Markdown")
     except Exception as e:
-        print(f"Lỗi hệ thống: {e}")
-        await update.message.reply_text("❗ Đã xảy ra lỗi khi xử lý ảnh.")
+        await update.message.reply_text(f"❗ Lỗi: {str(e)}")
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if os.path.exists(temp_path): os.remove(temp_path)
 
-# ==========================================
-# 5. KHỞI CHẠY
-# ==========================================
 if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ Thiếu BOT_TOKEN trong Environment Variables")
-    else:
-        app = ApplicationBuilder().token(TOKEN).build()
-        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-        print("🚀 Bot đang chạy ngầm trên Render...")
-        app.run_polling(drop_pending_updates=True)
+    # Chạy server ảo ở luồng riêng để Render không tắt bot
+    threading.Thread(target=run_health_check, daemon=True).start()
+    
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    print("🚀 Bot Free đang chạy...")
+    app.run_polling(drop_pending_updates=True)
