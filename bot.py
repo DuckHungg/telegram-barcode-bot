@@ -4,6 +4,7 @@ import json
 import gspread
 import re
 import threading
+import numpy as np
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from oauth2client.service_account import ServiceAccountCredentials
@@ -11,7 +12,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ==========================================
-# 1. SERVER GIẢ ĐỂ CHẠY FREE TRÊN RENDER
+# 1. SERVER GIẢ (GIỮ BOT CHẠY FREE)
 # ==========================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -25,7 +26,7 @@ def run_health_check():
     server.serve_forever()
 
 # ==========================================
-# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG
+# 2. CẤU HÌNH GOOGLE SHEET
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
@@ -37,13 +38,12 @@ def connect_sheet():
         creds_dict = json.loads(creds_json)
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
-    except:
-        return None
+    except: return None
 
 sheet = connect_sheet()
 
 # ==========================================
-# 3. CHUẨN HÓA TIẾNG VIỆT (Fix lỗi nhận diện)
+# 3. CHUẨN HÓA TIẾNG VIỆT
 # ==========================================
 def clean_vntxt(text):
     if not text: return ""
@@ -66,7 +66,7 @@ def classify_issue(text):
     return "KHÁC"
 
 # ==========================================
-# 4. QUÉT MÃ VÀ XỬ LÝ (Sửa lỗi Unpack OpenCV)
+# 4. XỬ LÝ QUÉT MÃ NÂNG CAO
 # ==========================================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_path = f"img_{update.message.chat_id}.jpg"
@@ -75,32 +75,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = await update.message.photo[-1].get_file()
         await f.download_to_drive(temp_path)
 
+        # Đọc ảnh và chuyển hệ xám để quét tốt hơn
         img = cv2.imread(temp_path)
-        barcode = None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # Thử quét Barcode (Cách hứng giá trị an toàn)
-        try:
+        barcode = None
+
+        # Cách 1: Quét mã QR (Ưu tiên QRCodeDetector vì nó nhanh)
+        qr_det = cv2.QRCodeDetector()
+        ok, info, _, _ = qr_det.detectAndDecode(img)
+        if ok: barcode = info
+
+        # Cách 2: Nếu thất bại, quét Barcode bằng bộ lọc tăng tương phản
+        if not barcode:
             bd = cv2.barcode.BarcodeDetector()
+            # Thử trên ảnh gốc
             res = bd.detectAndDecode(img)
             if res[0] and res[1][0]:
                 barcode = res[1][0]
-        except: pass
-
-        # Thử quét QR nếu không có Barcode
-        if not barcode:
-            try:
-                qr = cv2.QRCodeDetector()
-                ret, info, _, _ = qr.detectAndDecode(img)
-                if ret: barcode = info
-            except: pass
+            else:
+                # Thử trên ảnh đã tăng độ nét (Laplacian)
+                sharp = cv2.addWeighted(img, 1.5, cv2.GaussianBlur(img, (0,0), 3), -0.5, 0)
+                res = bd.detectAndDecode(sharp)
+                if res[0] and res[1][0]: barcode = res[1][0]
 
         if not barcode:
-            await update.message.reply_text("❌ Không đọc được mã vạch/QR.")
+            await update.message.reply_text("❌ Không đọc được mã. Hãy chụp gần hơn và rõ nét nhé!")
             return
 
+        # Ghi dữ liệu
         issue = classify_issue(caption)
         user = update.message.from_user.full_name
-
         if sheet:
             sheet.append_row([datetime.now().strftime("%d/%m/%Y %H:%M:%S"), barcode, issue, user, caption])
             await update.message.reply_text(f"✅ **GHI NHẬN THÀNH CÔNG**\n📦 Mã: `{barcode}`\n⚠️ Lỗi: **{issue}**", parse_mode="Markdown")
@@ -113,10 +118,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(temp_path): os.remove(temp_path)
 
 if __name__ == "__main__":
-    # Chạy server giả để Render không tắt bot
     threading.Thread(target=run_health_check, daemon=True).start()
-    
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("🚀 Bot đang chạy...")
+    print("🚀 Bot nâng cấp đang chạy...")
     app.run_polling(drop_pending_updates=True)
