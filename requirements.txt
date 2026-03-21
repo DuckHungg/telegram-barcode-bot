@@ -1,4 +1,6 @@
 python-telegram-bot==20.7
-opencv-python
+opencv-python-headless
 pyzbar
 pillow
+gspread
+oauth2client
