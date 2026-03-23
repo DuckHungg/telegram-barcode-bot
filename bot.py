@@ -10,16 +10,34 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
 # ==========================================
-# CONFIG (ENV cho Render)
+# CONFIG
 # ==========================================
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("BOT_TOKEN", "8196905397:AAEgGhNZq_ziZt4qce0YVAAOxiXZbeJPxtM")
 SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
+LOCAL_JSON = "serviceaccountjson-460918-3c9ddf6c02df.json"
 
+# ==========================================
+# GOOGLE SHEET (ENV + FALLBACK LOCAL)
+# ==========================================
 def connect_sheet():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    try:
+        if "GOOGLE_CREDENTIALS_JSON" in os.environ:
+            creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        else:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(LOCAL_JSON, scope)
+
+        client = gspread.authorize(creds)
+        return client.open_by_key(SHEET_ID).sheet1
+
+    except Exception as e:
+        print("❌ Lỗi kết nối Google Sheet:", e)
+        return None
 
 sheet = connect_sheet()
 
@@ -58,7 +76,7 @@ def classify_issue(text):
     return None
 
 # ==========================================
-# PHÂN LOẠI TRẠNG THÁI MỚI
+# PHÂN LOẠI TRẠNG THÁI
 # ==========================================
 def classify_status(text):
     if not text: return None
@@ -76,7 +94,7 @@ def classify_status(text):
     return None
 
 # ==========================================
-# QUÉT VIDEO
+# SCAN VIDEO
 # ==========================================
 def scan_barcode_from_video(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -95,7 +113,7 @@ def scan_barcode_from_video(video_path):
     return None
 
 # ==========================================
-# HANDLE
+# HANDLE MEDIA
 # ==========================================
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -104,7 +122,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     issue = classify_issue(caption)
     status = classify_status(caption)
 
-    # chỉ xử lý nếu có ít nhất 1 trong 2
     if not issue and not status:
         return
 
@@ -112,11 +129,11 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_file = f"temp_{msg.chat_id}"
 
     try:
-        # tải file
         if msg.photo:
             file = await msg.photo[-1].get_file()
             temp_file += ".jpg"
             await file.download_to_drive(temp_file)
+
             img = cv2.imread(temp_file)
             results = decode(img)
             barcode = results[0].data.decode("utf-8") if results else None
@@ -126,12 +143,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file = await v_obj.get_file()
             temp_file += ".mp4"
             await file.download_to_drive(temp_file)
+
             barcode = scan_barcode_from_video(temp_file)
 
         else:
             return
 
-        # lưu sheet
         if barcode and sheet:
             sheet.append_row([
                 datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
@@ -142,7 +159,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption
             ])
 
-            # gửi lại ảnh + caption
             if msg.photo:
                 with open(temp_file, "rb") as p:
                     await msg.reply_photo(
@@ -156,21 +172,21 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             else:
                 await msg.reply_text(
-                    f"✅ OK\n📦 {barcode}\n⚠️ {issue}\n📍 {status}"
+                    f"📦 {barcode}\n⚠️ {issue}\n📍 {status}"
                 )
 
         elif not barcode:
             await msg.reply_text("❌ Không đọc được mã")
 
     except Exception as e:
-        print(e)
+        print("Lỗi:", e)
 
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
 # ==========================================
-# RUN
+# RUN BOT
 # ==========================================
 if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
@@ -178,5 +194,5 @@ if __name__ == "__main__":
     media_filter = filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
     app.add_handler(MessageHandler(media_filter, handle_media))
 
-    print("Bot running...")
+    print("🚀 Bot đang chạy...")
     app.run_polling()
