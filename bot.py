@@ -2,20 +2,24 @@ import os
 import cv2
 import gspread
 import re
+import asyncio
 from pyzbar.pyzbar import decode, ZBarSymbol
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram import Update, InputMediaPhoto, InputMediaVideo
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
 # ==========================================
-# 1. CẤU HÌNH
+# 1. CẤU HÌNH & BỘ NHỚ
 # ==========================================
 TOKEN = "8196905397:AAEgGhNZq_ziZt4qce0YVAAOxiXZbeJPxtM"
 SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
 LOCAL_JSON = "serviceaccountjson-460918-3c9ddf6c02df.json"
 
 BARCODE_TYPES = [ZBarSymbol.QRCODE, ZBarSymbol.CODE128, ZBarSymbol.CODE39, ZBarSymbol.EAN13]
+
+media_storage = {} 
+user_cache = {}
 
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -27,7 +31,7 @@ def connect_sheet():
 sheet = connect_sheet()
 
 # ==========================================
-# 2. ĐỒNG BỘ TỪ KHÓA (KHÔNG NHẬN NHẦM)
+# 2. LOGIC ĐIỀU KIỆN (GIỮ NGUYÊN)
 # ==========================================
 def clean_vntxt(text):
     if not text: return ""
@@ -43,96 +47,133 @@ def clean_vntxt(text):
 
 def get_synced_condition(text):
     if not text: return None
-    txt = clean_vntxt(text)
-    words = txt.split()
-
-    # DANH SÁCH ĐỒNG BỘ (Thêm bớt tùy ý bạn)
-    # Trạng thái giao nhận
-    if "cho lay" in txt: return "CHỜ LẤY"
-    if "dang lay" in txt: return "ĐANG LẤY"
-    if "dang giao" in txt: return "ĐANG GIAO"
-    if "da giao" in txt: return "ĐÃ GIAO"
-    if "cho tra" in txt: return "CHỜ TRẢ"
-    if "da tra" in txt: return "ĐÃ TRẢ"
-    if "huy" in txt: return "HỦY"
-    
-    # Loại lỗi (Ưu tiên kiểm tra cụm từ dài trước)
-    if any(x in txt for x in ["rach uot", "uot rach"]): return "RÁCH ƯỚT"
-    if any(x in txt for x in ["be uot", "uot be"]): return "BỂ ƯỚT"
-    if any(x in txt for x in ["be", "vo", "nat", "mop"]): return "BỂ VỠ"
-    if any(x in txt for x in ["rach", "bung", "thung"]) or ("ho" in words): return "BUNG RÁCH"
-    if any(x in txt for x in ["mat", "thieu", "rong"]): return "MẤT RUỘT"
-    
+    txt_orig = text.lower().strip()
+    txt_no_acc = clean_vntxt(txt_orig)
+    status_map = {"cho lay": "CHỜ LẤY", "dang lay": "ĐANG LẤY", "dang giao": "ĐANG GIAO", "da giao": "ĐÃ GIAO", "cho tra": "CHỜ TRẢ", "da tra": "ĐÃ TRẢ", "huy": "HỦY"}
+    for k, v in status_map.items():
+        if k in txt_no_acc: return v
+    if any(x in txt_no_acc for x in ["be", "vo", "nat", "mop"]): return "BỂ VỠ"
+    if any(x in txt_no_acc for x in ["rach", "bung", "thung"]) or re.search(r'\b(ho|hở)\b', txt_orig): return "BUNG RÁCH"
     return "KHÁC"
 
-# ==========================================
-# 3. QUÉT MÃ
-# ==========================================
 def scan_logic(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    results = decode(gray, symbols=BARCODE_TYPES)
-    return results[0].data.decode("utf-8") if results else None
+    res = decode(gray, symbols=BARCODE_TYPES)
+    if not res:
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        res = decode(thresh, symbols=BARCODE_TYPES)
+    return res[0].data.decode("utf-8") if res else None
 
+# ==========================================
+# 3. XỬ LÝ MEDIA & PHẢN HỒI ĐỦ ALBUM
+# ==========================================
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    caption = (msg.caption or "").strip()
+    uid = msg.chat_id
+    mg_id = msg.media_group_id
     
-    # Lấy điều kiện duy nhất
-    condition = get_synced_condition(caption)
-    if not condition: return # Không có chữ thì không làm gì
+    # Tạo định danh cho nhóm gửi
+    group_key = mg_id if mg_id else f"single_{msg.message_id}_{uid}"
+    
+    if group_key not in media_storage:
+        media_storage[group_key] = {"msgs": [], "caption": "", "processed": False}
+    
+    # Lưu tin nhắn vào nhóm
+    media_storage[group_key]["msgs"].append(msg)
+    if msg.caption:
+        media_storage[group_key]["caption"] = msg.caption
 
-    temp_file = f"temp_{msg.chat_id}"
-    try:
-        # Tải file
-        if msg.photo:
-            file = await msg.photo[-1].get_file()
-            temp_file += ".jpg"
-            await file.download_to_drive(temp_file)
-            img = cv2.imread(temp_file)
-            barcode = scan_logic(img)
-        elif msg.video or msg.video_note:
-            v_obj = msg.video or msg.video_note
-            file = await v_obj.get_file()
-            temp_file += ".mp4"
-            await file.download_to_drive(temp_file)
-            cap = cv2.VideoCapture(temp_file)
-            barcode, f_id = None, 0
-            while cap.isOpened() and f_id < 400:
-                ret, frame = cap.read()
-                if not ret: break
-                if f_id % 6 == 0:
+    # Chờ 2 giây để Telegram đẩy hết ảnh trong album qua
+    await asyncio.sleep(2) 
+    
+    # Kiểm tra nếu chưa được xử lý bởi tin nhắn cùng nhóm khác
+    if group_key in media_storage and not media_storage[group_key]["processed"]:
+        media_storage[group_key]["processed"] = True
+        current_data = media_storage.pop(group_key)
+        
+        condition = get_synced_condition(current_data["caption"])
+        media_results = []
+        final_barcode = None
+
+        # Quét TẤT CẢ ảnh trong Album
+        for m in current_data["msgs"]:
+            barcode = None
+            t_path = f"temp_{m.message_id}"
+            
+            if m.photo:
+                t_path += ".jpg"
+                f = await m.photo[-1].get_file()
+                await f.download_to_drive(t_path)
+                barcode = scan_logic(cv2.imread(t_path))
+                media_results.append({"type": "photo", "path": t_path})
+            
+            elif m.video or m.video_note:
+                t_path += ".mp4"
+                f = await (m.video or m.video_note).get_file()
+                await f.download_to_drive(t_path)
+                cap = cv2.VideoCapture(t_path)
+                # Quét nhanh 30 frame
+                for f_id in range(0, 300, 10):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, f_id)
+                    ret, frame = cap.read()
+                    if not ret: break
                     barcode = scan_logic(frame)
                     if barcode: break
-                f_id += 1
-            cap.release()
-        else: return
+                cap.release()
+                media_results.append({"type": "video", "path": t_path})
 
-        if barcode and sheet:
-            # Ghi vào Sheet: [Thời gian, Mã, Nội dung/Điều kiện, Caption gốc]
-            sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-                barcode, 
-                condition, 
-                caption
-            ])
-            await msg.reply_text(f"✅ **ĐÃ GHI NHẬN**\n📦 `{barcode}`\n📌 Phân loại: **{condition}**", parse_mode="Markdown")
-        elif not barcode:
-            await msg.reply_text("❌ Không tìm thấy mã vạch/QR.")
+            if barcode and not final_barcode:
+                final_barcode = barcode
 
-    except Exception as e: print(f"Lỗi: {e}")
-    finally:
-        if os.path.exists(temp_file): os.remove(temp_file)
+        if final_barcode:
+            if condition:
+                await send_full_group(update, final_barcode, condition, media_results)
+            else:
+                # Chờ chữ rời
+                user_cache[uid] = {"barcode": final_barcode, "media": media_results}
+                await asyncio.sleep(5)
+                if uid in user_cache:
+                    for r in media_results:
+                        if os.path.exists(r["path"]): os.remove(r["path"])
+                    del user_cache[uid]
+        else:
+            # Xóa file nếu không tìm thấy mã
+            for r in media_results:
+                if os.path.exists(r["path"]): os.remove(r["path"])
 
-async def send_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not sheet: return
-    today = datetime.now().strftime("%Y-%m-%d")
-    all_rows = sheet.get_all_values()
-    count = sum(1 for r in all_rows[1:] if r[0].startswith(today))
-    await update.message.reply_text(f"📊 Hôm nay đã quét: `{count}` đơn.")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.chat_id
+    condition = get_synced_condition(update.message.text)
+    if uid in user_cache and condition:
+        data = user_cache.pop(uid)
+        await send_full_group(update, data["barcode"], condition, data["media"])
+
+async def send_full_group(update, barcode, condition, media_list):
+    if sheet:
+        sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), barcode, condition, "Album Record"])
+    
+    result_txt = f"📦 `{barcode}`\n📌 {condition}"
+    final_media_group = []
+    
+    # Đóng gói TOÀN BỘ file đã tải vào 1 Media Group
+    for i, item in enumerate(media_list):
+        caption = result_txt if i == 0 else None # Gán chữ vào tấm đầu tiên
+        if item["type"] == "photo":
+            final_media_group.append(InputMediaPhoto(open(item["path"], 'rb'), caption=caption, parse_mode="Markdown"))
+        else:
+            final_media_group.append(InputMediaVideo(open(item["path"], 'rb'), caption=caption, parse_mode="Markdown"))
+
+    # Gửi lại toàn bộ cụm
+    if final_media_group:
+        await update.message.reply_media_group(media=final_media_group)
+
+    # Dọn dẹp sau khi gửi
+    for item in media_list:
+        if os.path.exists(item["path"]): os.remove(item["path"])
 
 if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("report", send_report))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE, handle_media))
-    print("🚀 Bot ĐỒNG BỘ đang chạy...")
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    print("🚀 Đã fix lỗi gửi Album: Bạn gửi bao nhiêu - Trả bấy nhiêu!")
     app.run_polling(drop_pending_updates=True)
