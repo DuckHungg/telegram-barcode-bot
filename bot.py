@@ -12,7 +12,7 @@ from datetime import datetime
 # ==========================================
 # CONFIG
 # ==========================================
-TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TOKEN")
+TOKEN = os.environ.get("BOT_TOKEN", "8196905397:AAEgGhNZq_ziZt4qce0YVAAOxiXZbeJPxtM")
 SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
 LOCAL_JSON = "serviceaccountjson-460918-3c9ddf6c02df.json"
 
