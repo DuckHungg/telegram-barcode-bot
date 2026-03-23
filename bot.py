@@ -17,7 +17,7 @@ SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
 LOCAL_JSON = "serviceaccountjson-460918-3c9ddf6c02df.json"
 
 # ==========================================
-# GOOGLE SHEET
+# GOOGLE SHEET (ENV + LOCAL)
 # ==========================================
 def connect_sheet():
     scope = [
@@ -32,16 +32,29 @@ def connect_sheet():
         creds = ServiceAccountCredentials.from_json_keyfile_name(LOCAL_JSON, scope)
 
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(SHEET_ID).sheet1
-
-    # đảm bảo header đúng
-    header = ["Time", "Barcode", "Issue", "Status"]
-    if sheet.row_values(1) != header:
-        sheet.insert_row(header, 1)
-
-    return sheet
+    return client.open_by_key(SHEET_ID).sheet1
 
 sheet = connect_sheet()
+
+# ==========================================
+# LẤY TOÀN BỘ TEXT (FIX FORWARD)
+# ==========================================
+def get_full_text(msg):
+    texts = []
+
+    if msg.caption:
+        texts.append(msg.caption)
+
+    if msg.text:
+        texts.append(msg.text)
+
+    if msg.reply_to_message:
+        if msg.reply_to_message.caption:
+            texts.append(msg.reply_to_message.caption)
+        if msg.reply_to_message.text:
+            texts.append(msg.reply_to_message.text)
+
+    return " ".join(texts).strip()
 
 # ==========================================
 # CLEAN TEXT
@@ -93,53 +106,80 @@ def classify_status(text):
     return ""
 
 # ==========================================
-# TĂNG ĐỘ NHẠY QUÉT
+# GHI CHUẨN CỘT (KHÔNG LỆCH)
 # ==========================================
-def scan_image_advanced(img):
+def write_row(barcode, issue, status):
+    next_row = len(sheet.col_values(1)) + 1
+
+    sheet.update(f"A{next_row}", [[datetime.now().strftime("%Y-%m-%d %H:%M:%S")]])
+    sheet.update(f"B{next_row}", [[barcode]])
+    sheet.update(f"C{next_row}", [[issue]])
+    sheet.update(f"D{next_row}", [[status]])
+
+# ==========================================
+# SCAN ẢNH (TỐI ƯU)
+# ==========================================
+def scan_image(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # nhiều phương án xử lý ảnh
     variants = [
         gray,
         cv2.GaussianBlur(gray, (5,5), 0),
         cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                              cv2.THRESH_BINARY,11,2)
     ]
 
-    for var in variants:
-        results = decode(var)
+    for v in variants:
+        results = decode(v)
         if results:
             return results[0].data.decode("utf-8")
 
     return None
 
+# ==========================================
+# SCAN VIDEO (PAUSE ẢO)
+# ==========================================
 def scan_barcode_from_video(video_path):
     cap = cv2.VideoCapture(video_path)
-    count = 0
+
+    best_barcode = None
+    best_score = 0
+    best_frame = None
+
+    frame_id = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
 
-        if count % 3 == 0:  # tăng tần suất scan
-            barcode = scan_image_advanced(frame)
-            if barcode:
-                cap.release()
-                return barcode
+        if frame_id % 2 == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            score = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-        count += 1
-        if count > 600: break
+            results = decode(gray)
+
+            if results and score > best_score:
+                best_score = score
+                best_barcode = results[0].data.decode("utf-8")
+                best_frame = frame.copy()
+
+        frame_id += 1
+        if frame_id > 800:
+            break
 
     cap.release()
-    return None
+
+    if best_frame is not None:
+        cv2.imwrite("best_frame.jpg", best_frame)
+
+    return best_barcode, "best_frame.jpg" if best_frame is not None else None
 
 # ==========================================
 # HANDLE
 # ==========================================
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    caption = (msg.caption or "").strip()
+    caption = get_full_text(msg)
 
     issue = classify_issue(caption)
     status = classify_status(caption)
@@ -156,29 +196,24 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file.download_to_drive(temp_file)
 
             img = cv2.imread(temp_file)
-            barcode = scan_image_advanced(img)
+            barcode = scan_image(img)
+            best_img = temp_file
 
         elif msg.video or msg.video_note:
             file = await (msg.video or msg.video_note).get_file()
             temp_file += ".mp4"
             await file.download_to_drive(temp_file)
 
-            barcode = scan_barcode_from_video(temp_file)
+            barcode, best_img = scan_barcode_from_video(temp_file)
 
         else:
             return
 
         if barcode:
-            sheet.append_row([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                barcode,
-                issue,
-                status
-            ])
+            write_row(barcode, issue, status)
 
-            # trả lại ảnh
-            if msg.photo:
-                with open(temp_file, "rb") as p:
+            if best_img and os.path.exists(best_img):
+                with open(best_img, "rb") as p:
                     await msg.reply_photo(
                         photo=p,
                         caption=f"📦 {barcode}\n⚠️ {issue or '-'}\n📍 {status or '-'}"
@@ -195,6 +230,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
+        if os.path.exists("best_frame.jpg"):
+            os.remove("best_frame.jpg")
 
 # ==========================================
 # RUN
@@ -202,8 +239,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
 
-    media_filter = filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
+    media_filter = filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.TEXT
     app.add_handler(MessageHandler(media_filter, handle_media))
 
-    print("🚀 Bot tối ưu đang chạy...")
+    print("🚀 Bot FULL đang chạy...")
     app.run_polling()
