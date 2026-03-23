@@ -3,47 +3,28 @@ import cv2
 import json
 import gspread
 import re
-import threading
-import numpy as np
+from pyzbar.pyzbar import decode
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ==========================================
-# 1. SERVER GIẢ (GIỮ BOT CHẠY FREE)
-# ==========================================
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
-
-def run_health_check():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
-
-# ==========================================
-# 2. CẤU HÌNH GOOGLE SHEET
+# CONFIG (ENV cho Render)
 # ==========================================
 TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID = "12ZYDWey6kFsFqAeYnN31BH8rVlDTQXZu8aG62B4JKi4"
 
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    try:
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        creds_dict = json.loads(creds_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
-    except: return None
+    creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    return gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
 
 sheet = connect_sheet()
 
 # ==========================================
-# 3. CHUẨN HÓA TIẾNG VIỆT
+# CLEAN TEXT
 # ==========================================
 def clean_vntxt(text):
     if not text: return ""
@@ -57,69 +38,145 @@ def clean_vntxt(text):
     s = re.sub(r'[đ]', 'd', s)
     return s
 
+# ==========================================
+# PHÂN LOẠI LỖI
+# ==========================================
 def classify_issue(text):
+    if not text: return None
     txt = clean_vntxt(text)
-    if any(x in txt for x in ["be", "vo", "nat", "gay", "mop"]): return "BỂ VỠ"
-    if any(x in txt for x in ["uot", "nuoc", "am", "tham"]): return "ƯỚT"
-    if any(x in txt for x in ["rach", "thung", "bung", "ho"]): return "BUNG RÁCH"
+
+    is_wet = any(x in txt for x in ["uot", "nuoc", "am", "tham"])
+    is_torn = any(x in txt for x in ["rach", "bung", "thung", "ho"])
+    is_broken = any(x in txt for x in ["be", "vo", "nat", "gay", "mop"])
+
+    if is_torn and is_wet: return "RÁCH ƯỚT"
+    if is_broken and is_wet: return "BỂ ƯỚT"
+    if is_broken: return "BỂ VỠ"
+    if is_torn: return "BUNG RÁCH"
     if any(x in txt for x in ["mat", "thieu", "rong"]): return "MẤT RUỘT"
-    return "KHÁC"
+
+    return None
 
 # ==========================================
-# 4. XỬ LÝ QUÉT MÃ NÂNG CAO
+# PHÂN LOẠI TRẠNG THÁI MỚI
 # ==========================================
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    temp_path = f"img_{update.message.chat_id}.jpg"
+def classify_status(text):
+    if not text: return None
+    txt = clean_vntxt(text)
+
+    if "cho lay" in txt: return "CHỜ LẤY"
+    if "dang lay" in txt: return "ĐANG LẤY"
+    if "dang giao" in txt: return "ĐANG GIAO"
+    if "da giao" in txt: return "ĐÃ GIAO"
+    if "cho tra" in txt: return "CHỜ TRẢ"
+    if "da tra" in txt: return "ĐÃ TRẢ"
+    if "huy" in txt: return "HỦY"
+    if "that lac" in txt: return "THẤT LẠC"
+
+    return None
+
+# ==========================================
+# QUÉT VIDEO
+# ==========================================
+def scan_barcode_from_video(video_path):
+    cap = cv2.VideoCapture(video_path)
+    count = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        if count % 6 == 0:
+            results = decode(frame)
+            if results:
+                cap.release()
+                return results[0].data.decode("utf-8")
+        count += 1
+        if count > 400: break
+    cap.release()
+    return None
+
+# ==========================================
+# HANDLE
+# ==========================================
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    caption = (msg.caption or "").strip()
+
+    issue = classify_issue(caption)
+    status = classify_status(caption)
+
+    # chỉ xử lý nếu có ít nhất 1 trong 2
+    if not issue and not status:
+        return
+
+    user_name = msg.from_user.full_name
+    temp_file = f"temp_{msg.chat_id}"
+
     try:
-        caption = update.message.caption or ""
-        f = await update.message.photo[-1].get_file()
-        await f.download_to_drive(temp_path)
+        # tải file
+        if msg.photo:
+            file = await msg.photo[-1].get_file()
+            temp_file += ".jpg"
+            await file.download_to_drive(temp_file)
+            img = cv2.imread(temp_file)
+            results = decode(img)
+            barcode = results[0].data.decode("utf-8") if results else None
 
-        # Đọc ảnh và chuyển hệ xám để quét tốt hơn
-        img = cv2.imread(temp_path)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        barcode = None
+        elif msg.video or msg.video_note:
+            v_obj = msg.video or msg.video_note
+            file = await v_obj.get_file()
+            temp_file += ".mp4"
+            await file.download_to_drive(temp_file)
+            barcode = scan_barcode_from_video(temp_file)
 
-        # Cách 1: Quét mã QR (Ưu tiên QRCodeDetector vì nó nhanh)
-        qr_det = cv2.QRCodeDetector()
-        ok, info, _, _ = qr_det.detectAndDecode(img)
-        if ok: barcode = info
-
-        # Cách 2: Nếu thất bại, quét Barcode bằng bộ lọc tăng tương phản
-        if not barcode:
-            bd = cv2.barcode.BarcodeDetector()
-            # Thử trên ảnh gốc
-            res = bd.detectAndDecode(img)
-            if res[0] and res[1][0]:
-                barcode = res[1][0]
-            else:
-                # Thử trên ảnh đã tăng độ nét (Laplacian)
-                sharp = cv2.addWeighted(img, 1.5, cv2.GaussianBlur(img, (0,0), 3), -0.5, 0)
-                res = bd.detectAndDecode(sharp)
-                if res[0] and res[1][0]: barcode = res[1][0]
-
-        if not barcode:
-            await update.message.reply_text("❌ Không đọc được mã. Hãy chụp gần hơn và rõ nét nhé!")
+        else:
             return
 
-        # Ghi dữ liệu
-        issue = classify_issue(caption)
-        user = update.message.from_user.full_name
-        if sheet:
-            sheet.append_row([datetime.now().strftime("%d/%m/%Y %H:%M:%S"), barcode, issue, user, caption])
-            await update.message.reply_text(f"✅ **GHI NHẬN THÀNH CÔNG**\n📦 Mã: `{barcode}`\n⚠️ Lỗi: **{issue}**", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❗ Lỗi kết nối Google Sheets.")
+        # lưu sheet
+        if barcode and sheet:
+            sheet.append_row([
+                datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                barcode,
+                issue if issue else "",
+                status if status else "",
+                user_name,
+                caption
+            ])
+
+            # gửi lại ảnh + caption
+            if msg.photo:
+                with open(temp_file, "rb") as p:
+                    await msg.reply_photo(
+                        photo=p,
+                        caption=(
+                            f"✅ OK\n"
+                            f"📦 {barcode}\n"
+                            f"⚠️ {issue if issue else '-'}\n"
+                            f"📍 {status if status else '-'}"
+                        )
+                    )
+            else:
+                await msg.reply_text(
+                    f"✅ OK\n📦 {barcode}\n⚠️ {issue}\n📍 {status}"
+                )
+
+        elif not barcode:
+            await msg.reply_text("❌ Không đọc được mã")
 
     except Exception as e:
-        await update.message.reply_text(f"❗ Lỗi: {str(e)}")
-    finally:
-        if os.path.exists(temp_path): os.remove(temp_path)
+        print(e)
 
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+# ==========================================
+# RUN
+# ==========================================
 if __name__ == "__main__":
-    threading.Thread(target=run_health_check, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("🚀 Bot nâng cấp đang chạy...")
-    app.run_polling(drop_pending_updates=True)
+    app = Application.builder().token(TOKEN).build()
+
+    media_filter = filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
+    app.add_handler(MessageHandler(media_filter, handle_media))
+
+    print("Bot running...")
+    app.run_polling()
